@@ -109,6 +109,11 @@ public class grinding : MonoBehaviour
 
 	private wall GetOrCreateWallSurface(Collider surfaceCollider)
 	{
+		if (surfaceCollider == null || surfaceCollider is CharacterController || surfaceCollider.GetComponentInParent<control>() != null)
+		{
+			return null;
+		}
+
 		wall wallSurface = surfaceCollider.GetComponentInParent<wall>();
 		if (wallSurface != null)
 		{

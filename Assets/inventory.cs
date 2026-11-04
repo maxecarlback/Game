@@ -18,7 +18,7 @@ public class inventory : MonoBehaviour
 
 	private void Update()
 	{
-		if (Keyboard.current == null || grabController == null)
+		if (EscMenu.IsPaused || Keyboard.current == null || grabController == null)
 		{
 			return;
 		}
@@ -70,6 +70,18 @@ public class inventory : MonoBehaviour
 		GameObject selectedItem = slots[slotIndex];
 		if (selectedItem == null)
 		{
+			if (!grabController.IsHoldingItem)
+			{
+				return;
+			}
+
+			GameObject heldItem = grabController.TakeHeldItem();
+			if (heldItem != null)
+			{
+				heldItem.SetActive(false);
+				slots[slotIndex] = heldItem;
+			}
+
 			return;
 		}
 
@@ -111,6 +123,11 @@ public class inventory : MonoBehaviour
 
 	private void OnGUI()
 	{
+		if (EscMenu.IsPaused)
+		{
+			return;
+		}
+
 		float totalWidth = SlotCount * SlotWidth + (SlotCount - 1) * SlotGap;
 		float startX = (Screen.width - totalWidth) * 0.5f;
 		float y = Screen.height - SlotHeight - 20f;
@@ -121,6 +138,12 @@ public class inventory : MonoBehaviour
 			string itemName = item != null ? item.name.Replace("(Clone)", "").Trim() : "Empty";
 			Rect slotRect = new Rect(startX + i * (SlotWidth + SlotGap), y, SlotWidth, SlotHeight);
 			GUI.Box(slotRect, $"{i + 1}\n{itemName}");
+		}
+
+		if (grabController != null && grabController.IsHoldingGun)
+		{
+			Rect crosshairRect = new Rect(Screen.width * 0.5f - 3f, Screen.height * 0.5f - 3f, 6f, 6f);
+			GUI.Box(crosshairRect, GUIContent.none);
 		}
 	}
 }

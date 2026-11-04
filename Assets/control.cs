@@ -36,7 +36,13 @@ public class control : MonoBehaviour
 	private float verticalVelocity;
 	private float standingHeight;
 	private Vector3 standingCenter;
+	private float standingCameraHeight = 0.72f;
+	private Vector3 currentHorizontalVelocity;
 	private float pitch;
+
+	public Vector3 HorizontalVelocity => currentHorizontalVelocity;
+	public bool IsGrounded => characterController != null && characterController.isGrounded;
+	public float StandingHeight => standingHeight;
 
 	private void Awake()
 	{
@@ -53,11 +59,27 @@ public class control : MonoBehaviour
 
 		if (cameraPivot != null)
 		{
+			cameraPivot.localPosition = new Vector3(0f, standingCameraHeight, 0.08f);
 			pitch = cameraPivot.localEulerAngles.x;
 			if (pitch > 180f)
 			{
 				pitch -= 360f;
 			}
+		}
+
+		if (GetComponent<PlayerModel>() == null)
+		{
+			gameObject.AddComponent<PlayerModel>();
+		}
+
+		if (FindAnyObjectByType<EscMenu>() == null)
+		{
+			new GameObject("Esc Menu").AddComponent<EscMenu>();
+		}
+
+		if (FindAnyObjectByType<Gun>() == null)
+		{
+			Gun.SpawnDefaultGun();
 		}
 
 		if (inputActions == null)
@@ -106,6 +128,12 @@ public class control : MonoBehaviour
 			return;
 		}
 
+		if (EscMenu.IsPaused)
+		{
+			currentHorizontalVelocity = Vector3.zero;
+			return;
+		}
+
 		UpdateCursor();
 		Look();
 		Move();
@@ -114,11 +142,7 @@ public class control : MonoBehaviour
 
 	private void UpdateCursor()
 	{
-		if (Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame)
-		{
-			SetCursorLocked(false);
-		}
-		else if (lockCursorOnStart && Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+		if (lockCursorOnStart && !EscMenu.IsPaused && Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
 		{
 			SetCursorLocked(true);
 		}
@@ -165,6 +189,7 @@ public class control : MonoBehaviour
 		Vector3 forward = Vector3.ProjectOnPlane(reference.forward, Vector3.up).normalized;
 		Vector3 right = Vector3.ProjectOnPlane(reference.right, Vector3.up).normalized;
 		Vector3 horizontalVelocity = (forward * input.y + right * input.x) * speed;
+		currentHorizontalVelocity = horizontalVelocity;
 
 		if (characterController.isGrounded)
 		{
@@ -196,6 +221,12 @@ public class control : MonoBehaviour
 		Vector3 center = standingCenter;
 		center.y -= (standingHeight - height) * 0.5f;
 		characterController.center = center;
+
+		if (cameraPivot != null)
+		{
+			float crouchOffset = standingHeight - height;
+			cameraPivot.localPosition = new Vector3(0f, standingCameraHeight - crouchOffset * 0.85f, 0.08f);
+		}
 	}
 
 	private bool CanStand()

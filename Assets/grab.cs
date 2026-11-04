@@ -27,13 +27,20 @@ public class grab : MonoBehaviour
 	private readonly List<CollisionPairState> ignoredCollisions = new List<CollisionPairState>();
 	private Collider[] playerColliders;
 	private Rigidbody heldBody;
+	private Gun heldGun;
 	private Quaternion heldRotationOffset;
 	private bool wasKinematic;
 	private bool usedGravity;
+	private bool pickedUpThisFrame;
 	private Vector3 lastHoldPosition;
 	private Vector3 heldVelocity;
+	private float lastGrabAttemptTime = -10f;
 
 	public bool IsHoldingItem => heldBody != null;
+	public bool IsHoldingGun => heldGun != null;
+	public Rigidbody HeldBody => heldBody;
+	public Camera PlayerCamera => playerCamera;
+	public float LastGrabAttemptTime => lastGrabAttemptTime;
 
 	private void Awake()
 	{
@@ -47,7 +54,7 @@ public class grab : MonoBehaviour
 
 	private void Update()
 	{
-		if (Mouse.current == null)
+		if (EscMenu.IsPaused || Mouse.current == null)
 		{
 			return;
 		}
@@ -68,16 +75,42 @@ public class grab : MonoBehaviour
 			TryPickup();
 		}
 
-		if (Mouse.current.leftButton.wasReleasedThisFrame && heldBody != null)
+		if (heldBody != null)
 		{
-			Drop(true);
+			if (heldGun != null)
+			{
+				if (!pickedUpThisFrame && Mouse.current.leftButton.wasPressedThisFrame)
+				{
+					heldGun.TryShoot(playerCamera);
+				}
+				else if (Mouse.current.rightButton.wasPressedThisFrame
+					|| (Keyboard.current != null && Keyboard.current.gKey.wasPressedThisFrame))
+				{
+					Drop(true);
+				}
+			}
+			else if (Mouse.current.leftButton.wasReleasedThisFrame)
+			{
+				Drop(true);
+			}
 		}
+
+		pickedUpThisFrame = false;
 	}
 
 	private void FixedUpdate()
 	{
 		if (heldBody == null)
 		{
+			return;
+		}
+
+		if (heldGun != null && playerCamera != null)
+		{
+			Vector3 targetPos = GetGunHoldPosition() + playerCamera.transform.TransformVector(heldGun.RecoilPositionOffset);
+			Quaternion targetRot = playerCamera.transform.rotation * heldGun.RecoilRotationOffset;
+			heldBody.MovePosition(targetPos);
+			heldBody.MoveRotation(targetRot);
 			return;
 		}
 
@@ -92,6 +125,8 @@ public class grab : MonoBehaviour
 
 	private void TryPickup()
 	{
+		lastGrabAttemptTime = Time.time;
+
 		if (playerCamera == null)
 		{
 			Debug.LogWarning("Assign a player camera to the grab component.", this);
@@ -163,16 +198,21 @@ public class grab : MonoBehaviour
 		body.linearVelocity = Vector3.zero;
 		body.angularVelocity = Vector3.zero;
 		heldBody = null;
+		heldGun = null;
 		return body.gameObject;
 	}
 
 	private void BeginHolding(Rigidbody body)
 	{
 		heldBody = body;
+		heldGun = body.GetComponent<Gun>();
+		pickedUpThisFrame = true;
 		wasKinematic = heldBody.isKinematic;
 		usedGravity = heldBody.useGravity;
-		heldRotationOffset = Quaternion.Inverse(playerCamera.transform.rotation) * heldBody.rotation;
-		lastHoldPosition = GetHoldPosition();
+		heldRotationOffset = heldGun != null
+			? Quaternion.identity
+			: Quaternion.Inverse(playerCamera.transform.rotation) * heldBody.rotation;
+		lastHoldPosition = heldGun != null ? GetGunHoldPosition() : GetHoldPosition();
 		heldVelocity = Vector3.zero;
 		heldBody.linearVelocity = Vector3.zero;
 		heldBody.angularVelocity = Vector3.zero;
@@ -261,6 +301,18 @@ public class grab : MonoBehaviour
 		}
 
 		heldBody = null;
+		heldGun = null;
+	}
+
+	private Vector3 GetGunHoldPosition()
+	{
+		Transform cameraTransform = playerCamera.transform;
+		Vector3 origin = cameraTransform.position;
+		Vector3 desiredPosition = origin
+			+ cameraTransform.forward * 0.68f
+			+ cameraTransform.right * 0.14f
+			- cameraTransform.up * 0.16f;
+		return ResolveObstacleSafePosition(origin, desiredPosition);
 	}
 
 	private Vector3 GetHoldPosition()
@@ -268,6 +320,11 @@ public class grab : MonoBehaviour
 		Transform cameraTransform = playerCamera.transform;
 		Vector3 origin = cameraTransform.position;
 		Vector3 desiredPosition = origin + cameraTransform.forward * holdDistance;
+		return ResolveObstacleSafePosition(origin, desiredPosition);
+	}
+
+	private Vector3 ResolveObstacleSafePosition(Vector3 origin, Vector3 desiredPosition)
+	{
 		Vector3 direction = desiredPosition - origin;
 		float distance = direction.magnitude;
 		if (distance <= 0f || obstacleCheckRadius <= 0f)
