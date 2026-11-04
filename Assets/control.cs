@@ -43,15 +43,19 @@ public class control : MonoBehaviour
 	private Vector3 currentHorizontalVelocity;
 	private Vector3 spawnPosition;
 	private Quaternion spawnRotation;
+	private grab grabController;
 	private float pitch;
 
 	public Vector3 HorizontalVelocity => currentHorizontalVelocity;
 	public bool IsGrounded => characterController != null && characterController.isGrounded;
+	public bool IsCrouching { get; private set; }
+	public float CrouchRatio { get; private set; }
 	public float StandingHeight => standingHeight;
 
 	private void Awake()
 	{
 		characterController = GetComponent<CharacterController>();
+		grabController = GetComponent<grab>();
 
 		CapsuleCollider capsuleCollider = GetComponent<CapsuleCollider>();
 		if (capsuleCollider != null)
@@ -150,8 +154,8 @@ public class control : MonoBehaviour
 
 		UpdateCursor();
 		Look();
-		Move();
 		UpdateCrouch();
+		Move();
 	}
 
 	private void UpdateCursor()
@@ -192,7 +196,7 @@ public class control : MonoBehaviour
 
 	private void Move()
 	{
-		bool crouching = crouchAction != null && crouchAction.IsPressed();
+		bool crouching = IsCrouching;
 		bool sprinting = !crouching && sprintAction != null && sprintAction.IsPressed();
 		float speed = crouching ? crouchSpeed : sprinting ? sprintSpeed : walkSpeed;
 
@@ -237,46 +241,75 @@ public class control : MonoBehaviour
 		characterController.enabled = true;
 	}
 
+	private bool IsCrouchPressed()
+	{
+		if (crouchAction != null && crouchAction.IsPressed())
+		{
+			return true;
+		}
+
+		return Keyboard.current != null
+			&& (Keyboard.current.leftCtrlKey.isPressed
+				|| Keyboard.current.rightCtrlKey.isPressed
+				|| Keyboard.current.cKey.isPressed);
+	}
+
 	private void UpdateCrouch()
 	{
-		bool wantsToCrouch = crouchAction != null && crouchAction.IsPressed();
-		float targetHeight = wantsToCrouch || !CanStand() ? crouchHeight : standingHeight;
-		targetHeight = Mathf.Clamp(targetHeight, characterController.radius * 2f, standingHeight);
+		bool wantsToCrouch = IsCrouchPressed();
+		float minCrouchHeight = Mathf.Max(characterController.radius * 2f + 0.05f, Mathf.Min(crouchHeight, 1.15f));
+		bool canStandUp = CanStand(minCrouchHeight);
+		IsCrouching = wantsToCrouch || !canStandUp;
 
+		float targetHeight = IsCrouching ? minCrouchHeight : standingHeight;
 		float height = Mathf.MoveTowards(characterController.height, targetHeight, crouchTransitionSpeed * Time.deltaTime);
 		characterController.height = height;
 
+		float heightDrop = standingHeight - height;
+		CrouchRatio = standingHeight > minCrouchHeight
+			? Mathf.Clamp01(heightDrop / (standingHeight - minCrouchHeight))
+			: 0f;
+
 		Vector3 center = standingCenter;
-		center.y -= (standingHeight - height) * 0.5f;
+		center.y -= heightDrop * 0.5f;
 		characterController.center = center;
 
 		if (cameraPivot != null)
 		{
-			float crouchOffset = standingHeight - height;
-			cameraPivot.localPosition = new Vector3(0f, standingCameraHeight - crouchOffset * 0.85f, 0.08f);
+			cameraPivot.localPosition = new Vector3(0f, standingCameraHeight - heightDrop * 0.90f, 0.08f);
 		}
 	}
 
-	private bool CanStand()
+	private bool CanStand(float currentCrouchHeight)
 	{
 		if (characterController.height >= standingHeight - 0.01f)
 		{
 			return true;
 		}
 
-		Vector3 worldCenter = transform.TransformPoint(standingCenter);
-		float radius = characterController.radius * 0.95f;
-		float halfSegment = Mathf.Max(0f, standingHeight * 0.5f - radius);
-		Vector3 bottom = worldCenter - Vector3.up * halfSegment;
-		Vector3 top = worldCenter + Vector3.up * halfSegment;
-		Collider[] overlaps = Physics.OverlapCapsule(bottom, top, radius, Physics.AllLayers, QueryTriggerInteraction.Ignore);
+		Vector3 worldStandingCenter = transform.TransformPoint(standingCenter);
+		float radius = characterController.radius * 0.88f;
+		Vector3 worldBottom = worldStandingCenter - Vector3.up * (standingHeight * 0.5f);
+
+		Vector3 checkBottom = worldBottom + Vector3.up * Mathf.Max(radius + 0.15f, currentCrouchHeight - radius * 0.5f);
+		Vector3 checkTop = worldBottom + Vector3.up * Mathf.Max(checkBottom.y - worldBottom.y + 0.05f, standingHeight - radius);
+
+		Collider[] overlaps = Physics.OverlapCapsule(checkBottom, checkTop, radius, Physics.AllLayers, QueryTriggerInteraction.Ignore);
+		Rigidbody heldBody = grabController != null ? grabController.HeldBody : null;
 
 		foreach (Collider overlap in overlaps)
 		{
-			if (overlap != characterController && !overlap.transform.IsChildOf(transform))
+			if (overlap == null || overlap == characterController || overlap.transform.IsChildOf(transform))
 			{
-				return false;
+				continue;
 			}
+
+			if (heldBody != null && (overlap.attachedRigidbody == heldBody || overlap.transform.IsChildOf(heldBody.transform)))
+			{
+				continue;
+			}
+
+			return false;
 		}
 
 		return true;

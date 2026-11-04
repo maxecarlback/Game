@@ -284,17 +284,19 @@ public class PlayerModel : MonoBehaviour
 		Vector3 center = characterController != null ? characterController.center : Vector3.zero;
 
 		float bottomY = center.y - currentHeight * 0.5f;
-		float crouchRatio = Mathf.InverseLerp(standingHeight, 1.2f, currentHeight);
+		float crouchRatio = playerControl != null
+			? playerControl.CrouchRatio
+			: Mathf.InverseLerp(standingHeight, 1.15f, currentHeight);
 
 		Transform camTransform = playerCamera != null ? playerCamera.transform : transform;
 		Vector3 camLocalPos = transform.InverseTransformPoint(camTransform.position);
 
-		float shoulderY = Mathf.Min(camLocalPos.y - 0.20f, bottomY + currentHeight * 0.72f);
-		float hipY = Mathf.Lerp(bottomY + 0.84f, bottomY + 0.54f, crouchRatio);
+		float shoulderY = Mathf.Min(camLocalPos.y - 0.18f, bottomY + currentHeight * 0.72f);
+		float hipY = Mathf.Lerp(bottomY + 0.84f, bottomY + 0.42f, crouchRatio);
 		float bobOffset = Mathf.Sin(walkCycle * 2f) * 0.018f * Mathf.Clamp01(smoothedSpeed / 5f);
 		hipY += bobOffset;
 
-		Vector3 hipCenterLocal = new Vector3(0f, hipY, -0.10f - crouchRatio * 0.08f);
+		Vector3 hipCenterLocal = new Vector3(0f, hipY, -0.10f - crouchRatio * 0.12f);
 		Vector3 shoulderCenterLocal = new Vector3(0f, shoulderY + bobOffset * 0.5f, -0.08f);
 
 		Vector3 hipWorld = transform.TransformPoint(hipCenterLocal);
