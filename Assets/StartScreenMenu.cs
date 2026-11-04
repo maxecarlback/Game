@@ -16,6 +16,8 @@ public class StartScreenMenu : MonoBehaviour
 
 	private Text volumeLabel;
 	private GameObject optionsPanel;
+	private InputField joinAddressInput;
+	private Text joinStatusText;
 
 	[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
 	private static void RegisterSceneListener()
@@ -70,8 +72,96 @@ public class StartScreenMenu : MonoBehaviour
 		CreateText(canvas.transform, "Footer", "READY WHEN YOU ARE", 14, new Color(0.48f, 0.54f, 0.50f), TextAnchor.MiddleLeft,
 			new Vector2(0.12f, 0.08f), new Vector2(0.48f, 0.12f), Vector2.zero, Vector2.zero, FontStyle.Normal);
 
+		BuildMultiplayerJoinBox(canvas.transform);
 		BuildOptionsPanel(canvas.transform);
 		EnsureEventSystem();
+	}
+
+	private void BuildMultiplayerJoinBox(Transform parent)
+	{
+		GameObject joinPanel = new GameObject("Join Multiplayer Panel", typeof(RectTransform), typeof(Image));
+		joinPanel.transform.SetParent(parent, false);
+		SetRect(joinPanel.GetComponent<RectTransform>(), new Vector2(0.52f, 0.24f), new Vector2(0.90f, 0.58f), Vector2.zero, Vector2.zero);
+		joinPanel.GetComponent<Image>().color = PanelColor;
+
+		Image accent = CreateImage(joinPanel.transform, "JoinAccent", new Vector2(0f, 0.08f), new Vector2(0.012f, 0.92f), Vector2.zero, Vector2.zero, AccentColor);
+		accent.raycastTarget = false;
+
+		CreateText(joinPanel.transform, "Join Title", "JOIN MULTIPLAYER", 26, TextColor, TextAnchor.MiddleLeft,
+			new Vector2(0.07f, 0.74f), new Vector2(0.93f, 0.90f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		CreateText(joinPanel.transform, "Join Subtitle", "ENTER HOST IP:PORT", 14, new Color(0.66f, 0.70f, 0.66f), TextAnchor.MiddleLeft,
+			new Vector2(0.07f, 0.60f), new Vector2(0.93f, 0.72f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		GameObject inputObj = new GameObject("IP InputField", typeof(RectTransform), typeof(Image), typeof(InputField));
+		inputObj.transform.SetParent(joinPanel.transform, false);
+		SetRect(inputObj.GetComponent<RectTransform>(), new Vector2(0.07f, 0.38f), new Vector2(0.72f, 0.56f), Vector2.zero, Vector2.zero);
+		Image inputBg = inputObj.GetComponent<Image>();
+		inputBg.color = new Color(0.06f, 0.08f, 0.075f, 1f);
+
+		Text placeholder = CreateText(inputObj.transform, "Placeholder", "e.g. 127.0.0.1:7777", 18, new Color(0.45f, 0.50f, 0.47f, 0.85f), TextAnchor.MiddleLeft,
+			new Vector2(0.05f, 0.08f), new Vector2(0.95f, 0.92f), Vector2.zero, Vector2.zero, FontStyle.Italic);
+
+		Text inputText = CreateText(inputObj.transform, "Text", "", 19, TextColor, TextAnchor.MiddleLeft,
+			new Vector2(0.05f, 0.08f), new Vector2(0.95f, 0.92f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+		inputText.supportRichText = false;
+
+		joinAddressInput = inputObj.GetComponent<InputField>();
+		joinAddressInput.targetGraphic = inputBg;
+		joinAddressInput.textComponent = inputText;
+		joinAddressInput.placeholder = placeholder;
+		joinAddressInput.lineType = InputField.LineType.SingleLine;
+		joinAddressInput.text = "127.0.0.1:7777";
+
+		CreateJoinPanelButton(joinPanel.transform, "Paste", "PASTE", new Vector2(0.74f, 0.38f), new Vector2(0.93f, 0.56f), false, PasteClipboardAddress);
+		CreateJoinPanelButton(joinPanel.transform, "Join", "JOIN GAME", new Vector2(0.07f, 0.14f), new Vector2(0.93f, 0.31f), true, JoinMultiplayerGame);
+
+		joinStatusText = CreateText(joinPanel.transform, "JoinStatus", "", 13, AccentColor, TextAnchor.MiddleLeft,
+			new Vector2(0.07f, 0.02f), new Vector2(0.93f, 0.12f), Vector2.zero, Vector2.zero, FontStyle.Normal);
+	}
+
+	private void CreateJoinPanelButton(Transform parent, string name, string label, Vector2 anchorMin, Vector2 anchorMax, bool primary, UnityEngine.Events.UnityAction action)
+	{
+		Button button = new GameObject(name + " Button", typeof(RectTransform), typeof(Image), typeof(Button)).GetComponent<Button>();
+		button.transform.SetParent(parent, false);
+		SetRect(button.GetComponent<RectTransform>(), anchorMin, anchorMax, Vector2.zero, Vector2.zero);
+
+		Image image = button.GetComponent<Image>();
+		image.color = primary ? AccentColor : new Color(0.16f, 0.21f, 0.19f, 1f);
+		button.targetGraphic = image;
+		ColorBlock colors = button.colors;
+		colors.normalColor = image.color;
+		colors.highlightedColor = primary ? new Color(1f, 0.66f, 0.34f) : new Color(0.23f, 0.29f, 0.26f);
+		colors.pressedColor = new Color(0.72f, 0.39f, 0.19f);
+		colors.selectedColor = colors.highlightedColor;
+		button.colors = colors;
+		button.onClick.AddListener(action);
+
+		CreateText(button.transform, "Label", label, 17, primary ? BackgroundColor : TextColor, TextAnchor.MiddleCenter,
+			new Vector2(0.04f, 0f), new Vector2(0.96f, 1f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+	}
+
+	private void PasteClipboardAddress()
+	{
+		if (joinAddressInput != null && !string.IsNullOrWhiteSpace(GUIUtility.systemCopyBuffer))
+		{
+			joinAddressInput.text = GUIUtility.systemCopyBuffer.Trim();
+		}
+	}
+
+	private void JoinMultiplayerGame()
+	{
+		string address = joinAddressInput != null ? joinAddressInput.text.Trim() : "";
+		if (!MultiplayerManager.TryParseAddress(address, out _, out _))
+		{
+			if (joinStatusText != null)
+			{
+				joinStatusText.text = "Enter a valid IP:Port (e.g. 192.168.1.10:7777)";
+			}
+			return;
+		}
+
+		MultiplayerManager.JoinFromMenu(address);
 	}
 
 	private void BuildOptionsPanel(Transform parent)

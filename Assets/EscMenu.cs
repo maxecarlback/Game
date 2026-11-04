@@ -21,6 +21,10 @@ public class EscMenu : MonoBehaviour
 
 	private GameObject menuRoot;
 	private GameObject optionsPanel;
+	private GameObject multiplayerPanel;
+	private Text multiplayerIpLabel;
+	private Text multiplayerStatusLabel;
+	private Text copyFeedbackLabel;
 	private Text volumeLabel;
 	private Slider volumeSlider;
 	private Toggle fullscreenToggle;
@@ -54,6 +58,11 @@ public class EscMenu : MonoBehaviour
 
 	private void OnDestroy()
 	{
+		if (MultiplayerManager.Instance != null)
+		{
+			MultiplayerManager.Instance.OnStatusChanged -= RefreshMultiplayerLabels;
+		}
+
 		if (IsPaused)
 		{
 			IsPaused = false;
@@ -69,6 +78,10 @@ public class EscMenu : MonoBehaviour
 			{
 				optionsPanel.SetActive(false);
 			}
+			else if (IsPaused && multiplayerPanel != null && multiplayerPanel.activeSelf)
+			{
+				multiplayerPanel.SetActive(false);
+			}
 			else
 			{
 				SetPaused(!IsPaused);
@@ -79,16 +92,19 @@ public class EscMenu : MonoBehaviour
 	public void SetPaused(bool paused)
 	{
 		IsPaused = paused;
-		Time.timeScale = paused ? 0f : 1f;
+		bool inMultiplayer = MultiplayerManager.Instance != null
+			&& (MultiplayerManager.Instance.IsHosting || MultiplayerManager.Instance.IsClient);
+		Time.timeScale = (paused && !inMultiplayer) ? 0f : 1f;
 
 		if (menuRoot != null)
 		{
 			menuRoot.SetActive(paused);
 		}
 
-		if (!paused && optionsPanel != null)
+		if (!paused)
 		{
-			optionsPanel.SetActive(false);
+			if (optionsPanel != null) optionsPanel.SetActive(false);
+			if (multiplayerPanel != null) multiplayerPanel.SetActive(false);
 		}
 
 		if (paused)
@@ -153,13 +169,19 @@ public class EscMenu : MonoBehaviour
 		CreateText(mainPanel.transform, "Subtitle", "PRESS ESC TO RESUME", 16, MutedTextColor, TextAnchor.MiddleLeft,
 			new Vector2(0.10f, 0.61f), new Vector2(0.90f, 0.67f), Vector2.zero, Vector2.zero, FontStyle.Normal);
 
-		CreateButton(mainPanel.transform, "Resume", "RESUME", new Vector2(0.10f, 0.46f), new Vector2(0.90f, 0.55f), true, () => SetPaused(false));
-		CreateButton(mainPanel.transform, "Options", "OPTIONS", new Vector2(0.10f, 0.34f), new Vector2(0.90f, 0.43f), false, ToggleOptions);
-		CreateButton(mainPanel.transform, "MainMenu", "MAIN MENU", new Vector2(0.10f, 0.22f), new Vector2(0.90f, 0.31f), false, LoadMainMenu);
-		CreateButton(mainPanel.transform, "Quit", "QUIT", new Vector2(0.10f, 0.10f), new Vector2(0.90f, 0.19f), false, Quit);
+		CreateButton(mainPanel.transform, "Resume", "RESUME", new Vector2(0.10f, 0.49f), new Vector2(0.90f, 0.57f), true, () => SetPaused(false));
+		CreateButton(mainPanel.transform, "Multiplayer", "OPEN TO MULTIPLAYER", new Vector2(0.10f, 0.39f), new Vector2(0.90f, 0.47f), false, OpenToMultiplayer);
+		CreateButton(mainPanel.transform, "Options", "OPTIONS", new Vector2(0.10f, 0.29f), new Vector2(0.90f, 0.37f), false, ToggleOptions);
+		CreateButton(mainPanel.transform, "MainMenu", "MAIN MENU", new Vector2(0.10f, 0.19f), new Vector2(0.90f, 0.27f), false, LoadMainMenu);
+		CreateButton(mainPanel.transform, "Quit", "QUIT", new Vector2(0.10f, 0.09f), new Vector2(0.90f, 0.17f), false, Quit);
 
 		BuildOptionsPanel(menuRoot.transform);
+		BuildMultiplayerPanel(menuRoot.transform);
 		EnsureEventSystem();
+
+		MultiplayerManager mgr = MultiplayerManager.EnsureInstance();
+		mgr.OnStatusChanged -= RefreshMultiplayerLabels;
+		mgr.OnStatusChanged += RefreshMultiplayerLabels;
 	}
 
 	private void BuildOptionsPanel(Transform parent)
@@ -287,9 +309,104 @@ public class EscMenu : MonoBehaviour
 
 	private void ToggleOptions()
 	{
+		if (multiplayerPanel != null)
+		{
+			multiplayerPanel.SetActive(false);
+		}
+
 		if (optionsPanel != null)
 		{
 			optionsPanel.SetActive(!optionsPanel.activeSelf);
+		}
+	}
+
+	private void BuildMultiplayerPanel(Transform parent)
+	{
+		multiplayerPanel = new GameObject("Multiplayer Panel", typeof(RectTransform), typeof(Image));
+		multiplayerPanel.transform.SetParent(parent, false);
+		SetRect(multiplayerPanel.GetComponent<RectTransform>(), new Vector2(0.50f, 0.18f), new Vector2(0.90f, 0.82f), Vector2.zero, Vector2.zero);
+		multiplayerPanel.GetComponent<Image>().color = PanelColor;
+
+		CreateText(multiplayerPanel.transform, "MP Title", "MULTIPLAYER HOST", 28, TextColor, TextAnchor.MiddleLeft,
+			new Vector2(0.08f, 0.82f), new Vector2(0.92f, 0.93f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		CreateText(multiplayerPanel.transform, "MP Subtitle", "SHARE THIS IP:PORT WITH OTHER PLAYERS:", 15, MutedTextColor, TextAnchor.MiddleLeft,
+			new Vector2(0.08f, 0.72f), new Vector2(0.92f, 0.80f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		Image ipBox = CreateImage(multiplayerPanel.transform, "IP Box", new Vector2(0.08f, 0.56f), new Vector2(0.92f, 0.71f), Vector2.zero, Vector2.zero, new Color(0.06f, 0.08f, 0.075f, 1f));
+		ipBox.raycastTarget = false;
+
+		multiplayerIpLabel = CreateText(multiplayerPanel.transform, "IP Value", "OPENING...", 26, AccentColor, TextAnchor.MiddleCenter,
+			new Vector2(0.10f, 0.56f), new Vector2(0.90f, 0.71f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		multiplayerStatusLabel = CreateText(multiplayerPanel.transform, "MP Status", "Initializing NAT hole-punching & UPnP...", 15, TextColor, TextAnchor.UpperLeft,
+			new Vector2(0.08f, 0.36f), new Vector2(0.92f, 0.53f), Vector2.zero, Vector2.zero, FontStyle.Normal);
+
+		copyFeedbackLabel = CreateText(multiplayerPanel.transform, "Copy Feedback", "", 14, AccentColor, TextAnchor.MiddleLeft,
+			new Vector2(0.08f, 0.23f), new Vector2(0.92f, 0.30f), Vector2.zero, Vector2.zero, FontStyle.Bold);
+
+		CreateButton(multiplayerPanel.transform, "CopyIP", "COPY IP:PORT", new Vector2(0.08f, 0.24f), new Vector2(0.54f, 0.34f), true, CopyMultiplayerAddress);
+		CreateButton(multiplayerPanel.transform, "CloseMP", "BACK", new Vector2(0.58f, 0.24f), new Vector2(0.92f, 0.34f), false, () => multiplayerPanel.SetActive(false));
+
+		CreateText(multiplayerPanel.transform, "Port Note", "No router port forwarding required (UPnP + STUN Hole-Punching)", 13, MutedTextColor, TextAnchor.MiddleLeft,
+			new Vector2(0.08f, 0.08f), new Vector2(0.92f, 0.18f), Vector2.zero, Vector2.zero, FontStyle.Normal);
+
+		multiplayerPanel.SetActive(false);
+	}
+
+	private void OpenToMultiplayer()
+	{
+		if (optionsPanel != null)
+		{
+			optionsPanel.SetActive(false);
+		}
+
+		if (multiplayerPanel != null)
+		{
+			multiplayerPanel.SetActive(true);
+		}
+
+		Time.timeScale = 1f;
+		MultiplayerManager mgr = MultiplayerManager.EnsureInstance();
+		if (!mgr.IsHosting)
+		{
+			mgr.StartHosting();
+		}
+
+		RefreshMultiplayerLabels();
+	}
+
+	private void CopyMultiplayerAddress()
+	{
+		MultiplayerManager mgr = MultiplayerManager.Instance;
+		if (mgr != null && !string.IsNullOrEmpty(mgr.DisplayAddress))
+		{
+			GUIUtility.systemCopyBuffer = mgr.DisplayAddress;
+			if (copyFeedbackLabel != null)
+			{
+				copyFeedbackLabel.text = "COPIED: " + mgr.DisplayAddress;
+			}
+		}
+	}
+
+	private void RefreshMultiplayerLabels()
+	{
+		MultiplayerManager mgr = MultiplayerManager.Instance;
+		if (mgr == null)
+		{
+			return;
+		}
+
+		if (multiplayerIpLabel != null)
+		{
+			multiplayerIpLabel.text = !string.IsNullOrEmpty(mgr.DisplayAddress) ? mgr.DisplayAddress : "OPENING...";
+		}
+
+		if (multiplayerStatusLabel != null)
+		{
+			string lanInfo = !string.IsNullOrEmpty(mgr.LocalIpPort) ? $"LAN IP:Port: {mgr.LocalIpPort}\n" : "";
+			string pubInfo = !string.IsNullOrEmpty(mgr.PublicIpPort) ? $"Public IP:Port: {mgr.PublicIpPort}\n" : "";
+			multiplayerStatusLabel.text = $"{pubInfo}{lanInfo}Players Connected: {mgr.ConnectedPeerCount + 1}";
 		}
 	}
 

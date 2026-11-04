@@ -317,6 +317,10 @@ public class Gun : MonoBehaviour
 
 		SpawnBulletVisual(shootOrigin, shootDir);
 		StartCoroutine(FlashMuzzle());
+		if (MultiplayerManager.Instance != null)
+		{
+			MultiplayerManager.Instance.BroadcastShot(shootOrigin, shootDir);
+		}
 		return true;
 	}
 

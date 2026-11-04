@@ -121,6 +121,7 @@ public class control : MonoBehaviour
 	private void Start()
 	{
 		VoidRespawn.AttachToAllSceneRigidbodies(voidThresholdY);
+		MultiplayerManager.EnsureInstance().RefreshSceneReferences();
 
 		if (lockCursorOnStart)
 		{
