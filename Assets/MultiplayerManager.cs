@@ -3,8 +3,8 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -21,6 +21,7 @@ public class MultiplayerManager : MonoBehaviour
 		public string peerId;
 		public IPEndPoint udpEndpoint;
 		public float lastSeenTime;
+		public float lastDirectUdpTime;
 		public Vector3 position;
 		public float yaw;
 		public float pitch;
@@ -30,12 +31,6 @@ public class MultiplayerManager : MonoBehaviour
 		public int heldObjectId = -1;
 		public bool isHoldingGun;
 		public RemotePlayerAvatar avatar;
-	}
-
-	private struct OutgoingRelayMessage
-	{
-		public string topic;
-		public string payload;
 	}
 
 	public static MultiplayerManager Instance { get; private set; }
@@ -56,10 +51,14 @@ public class MultiplayerManager : MonoBehaviour
 
 	private string localPeerId;
 	private UdpClient udpClient;
+	private TcpListener tcpListener;
+	private readonly List<TcpClient> connectedTcpClients = new List<TcpClient>();
 	private int boundPort;
 	private volatile IPEndPoint discoveredStunEndpoint;
 	private CancellationTokenSource netCts;
-	private readonly ConcurrentQueue<(IPEndPoint ep, string msg)> incomingPackets = new ConcurrentQueue<(IPEndPoint, string)>();
+
+	private readonly ConcurrentQueue<(IPEndPoint ep, string msg, bool isDirect)> incomingPackets =
+		new ConcurrentQueue<(IPEndPoint, string, bool)>();
 	private readonly ConcurrentQueue<Action> mainThreadActions = new ConcurrentQueue<Action>();
 	private readonly Dictionary<string, PeerState> peers = new Dictionary<string, PeerState>();
 
@@ -68,11 +67,12 @@ public class MultiplayerManager : MonoBehaviour
 	private readonly Dictionary<int, float> objectAuthorityUntil = new Dictionary<int, float>();
 
 	private IPEndPoint targetHostEndpoint;
-	private string activeRelayTopic;
-	private bool relayPollRunning;
+	private int targetHostPort = 7777;
+	private string primaryRelayTopic;
+	private string secondaryRelayTopic;
 	private float nextStateSendTime;
 	private float nextHelloTime;
-	private float nextRelaySendTime;
+	private float nextRelayStateTime;
 	private int nextObjectSyncCursor;
 
 	private control localPlayer;
@@ -206,42 +206,49 @@ public class MultiplayerManager : MonoBehaviour
 
 		Application.runInBackground = true;
 		netCts = new CancellationTokenSource();
+		CancellationToken token = netCts.Token;
 
-		boundPort = BindUdpSocket(7777);
+		boundPort = BindServerSockets(7777);
 		string localIp = GetLocalLanIPv4();
 		LocalIpPort = $"{localIp}:{boundPort}";
 		PublicIpPort = "";
 		IsHosting = true;
 		IsClient = false;
 
-		SetStatus($"Opening multiplayer on {LocalIpPort} (mapping NAT/STUN...)");
-		StartReceiveLoop(netCts.Token);
+		SetStatus($"Hosting on LAN: {LocalIpPort} (discovering public IP & mapping UPnP...)");
+		StartUdpReceiveLoop(token);
+		StartTcpAcceptLoop(token);
 
-		// Subscribe to LAN + Local relay topic immediately
-		StartRelayListener(GetRelayTopic(LocalIpPort));
+		primaryRelayTopic = GetRelayTopic(LocalIpPort);
+		StartRelayStream(primaryRelayTopic, token);
+		// Also listen on a port-only relay topic so local/external IP mismatches on the same port still find each other!
+		StartRelayStream(GetPortRelayTopic(boundPort), token);
 
-		// Discover STUN public IP:Port and attempt automatic UPnP port mapping in background
-		CancellationToken token = netCts.Token;
 		Task.Run(async () =>
 		{
-			IPEndPoint stunEp = await QueryStunPublicEndpointAsync(udpClient);
 			bool upnpMapped = await TryMapUpnpPortAsync(boundPort, token);
+			IPEndPoint stunEp = await QueryStunPublicEndpointAsync(udpClient);
+			string publicIp = stunEp != null ? stunEp.Address.ToString() : await FetchPublicIpHttpAsync();
 
 			mainThreadActions.Enqueue(() =>
 			{
 				if (!IsHosting) return;
 
-				if (stunEp != null)
+				if (!string.IsNullOrEmpty(publicIp))
 				{
-					PublicIpPort = $"{stunEp.Address}:{stunEp.Port}";
-					StartRelayListener(GetRelayTopic(PublicIpPort));
+					int advertisedPort = (stunEp != null && !upnpMapped) ? stunEp.Port : boundPort;
+					PublicIpPort = $"{publicIp}:{advertisedPort}";
+					secondaryRelayTopic = GetRelayTopic(PublicIpPort);
+					StartRelayStream(secondaryRelayTopic, token);
+
+					if (advertisedPort != boundPort)
+					{
+						StartRelayStream(GetRelayTopic($"{publicIp}:{boundPort}"), token);
+					}
 				}
 
-				string natMode = upnpMapped ? "UPnP + Hole-Punch Ready" : "NAT Hole-Punch + Relay Ready";
-				string shown = !string.IsNullOrEmpty(PublicIpPort)
-					? $"{PublicIpPort}  (LAN: {LocalIpPort})"
-					: LocalIpPort;
-				SetStatus($"OPEN ON: {shown}\n({natMode} - No port forwarding needed)");
+				string mode = upnpMapped ? "UPnP + Hole-Punch Active" : "NAT Hole-Punch + Relay Active";
+				SetStatus($"OPEN! Share IP:Port: {DisplayAddress}  |  LAN: {LocalIpPort} ({mode})");
 			});
 		}, token);
 	}
@@ -259,10 +266,12 @@ public class MultiplayerManager : MonoBehaviour
 
 		Application.runInBackground = true;
 		netCts = new CancellationTokenSource();
+		CancellationToken token = netCts.Token;
 
-		boundPort = BindUdpSocket(0);
+		boundPort = BindUdpOnlySocket(0);
 		string localIp = GetLocalLanIPv4();
 		LocalIpPort = $"{localIp}:{boundPort}";
+		targetHostPort = port;
 		IsClient = true;
 		IsHosting = false;
 
@@ -272,23 +281,28 @@ public class MultiplayerManager : MonoBehaviour
 			targetHostEndpoint = new IPEndPoint(resolvedIp, port);
 		}
 
-		string normalizedTarget = $"{hostStr}:{port}";
-		SetStatus($"Connecting to {normalizedTarget}...");
+		string cleanTarget = $"{hostStr}:{port}";
+		SetStatus($"Connecting to {cleanTarget}...");
 
-		StartReceiveLoop(netCts.Token);
-		StartRelayListener(GetRelayTopic(normalizedTarget));
+		StartUdpReceiveLoop(token);
 
-		// Also discover our own STUN public endpoint and send hole-punch announcement via signaling channel
-		CancellationToken token = netCts.Token;
+		// Listen to both the exact IP:Port topic and the port-level rendezvous topic
+		primaryRelayTopic = GetRelayTopic(cleanTarget);
+		StartRelayStream(primaryRelayTopic, token);
+		StartRelayStream(GetPortRelayTopic(port), token);
+
+		// Also try TCP connection in background (works across localhost, LAN, and UPnP)
+		Task.Run(() => TryConnectTcpClientAsync(hostStr, port, token), token);
+
+		// Discover our STUN endpoint and send NAT hole-punch request
 		Task.Run(async () =>
 		{
 			IPEndPoint myStun = await QueryStunPublicEndpointAsync(udpClient);
-			mainThreadActions.Enqueue(() =>
-			{
-				if (!IsClient) return;
-				string myPublic = myStun != null ? $"{myStun.Address}:{myStun.Port}" : LocalIpPort;
-				SendRelayPacket(activeRelayTopic, $"PUNCH|{localPeerId}|{myPublic}|{LocalIpPort}");
-			});
+			string myPublic = myStun != null ? $"{myStun.Address}:{myStun.Port}" : LocalIpPort;
+			string punchMsg = $"PUNCH|{localPeerId}|{myPublic}|{LocalIpPort}";
+
+			await PostRelayMessageAsync(primaryRelayTopic, punchMsg, token);
+			await PostRelayMessageAsync(GetPortRelayTopic(port), punchMsg, token);
 		}, token);
 	}
 
@@ -296,8 +310,8 @@ public class MultiplayerManager : MonoBehaviour
 	{
 		IsHosting = false;
 		IsClient = false;
-		activeRelayTopic = null;
-		relayPollRunning = false;
+		primaryRelayTopic = null;
+		secondaryRelayTopic = null;
 
 		if (netCts != null)
 		{
@@ -310,6 +324,21 @@ public class MultiplayerManager : MonoBehaviour
 		{
 			try { udpClient.Close(); } catch { }
 			udpClient = null;
+		}
+
+		if (tcpListener != null)
+		{
+			try { tcpListener.Stop(); } catch { }
+			tcpListener = null;
+		}
+
+		lock (connectedTcpClients)
+		{
+			for (int i = 0; i < connectedTcpClients.Count; i++)
+			{
+				try { connectedTcpClients[i]?.Close(); } catch { }
+			}
+			connectedTcpClients.Clear();
 		}
 
 		foreach (KeyValuePair<string, PeerState> kvp in peers)
@@ -326,37 +355,149 @@ public class MultiplayerManager : MonoBehaviour
 		SetStatus("Not connected");
 	}
 
-	private int BindUdpSocket(int preferredPort)
+	private int BindServerSockets(int preferredPort)
 	{
-		for (int attempt = 0; attempt < 20; attempt++)
+		for (int attempt = 0; attempt < 25; attempt++)
 		{
-			int tryPort = preferredPort == 0 ? 0 : preferredPort + attempt;
+			int tryPort = preferredPort + attempt;
 			try
 			{
-				UdpClient client = new UdpClient(new IPEndPoint(IPAddress.Any, tryPort));
-				client.EnableBroadcast = true;
-				// Ignore ICMP Port Unreachable resets on Windows UDP sockets
-				try
-				{
-					const int SIO_UDP_CONNRESET = -1744830452;
-					client.Client.IOControl((IOControlCode)SIO_UDP_CONNRESET, new byte[] { 0, 0, 0, 0 }, null);
-				}
-				catch { }
+				// Starting TcpListener on IPAddress.Any triggers Windows Defender Firewall's standard network prompt
+				TcpListener listener = new TcpListener(IPAddress.Any, tryPort);
+				listener.Start();
 
-				udpClient = client;
-				return ((IPEndPoint)client.Client.LocalEndPoint).Port;
+				UdpClient udp = CreateConfiguredUdpClient(tryPort);
+				tcpListener = listener;
+				udpClient = udp;
+				return tryPort;
 			}
 			catch
 			{
-				if (preferredPort == 0) break;
+				try { tcpListener?.Stop(); } catch { }
+				tcpListener = null;
 			}
 		}
 
-		udpClient = new UdpClient(0);
+		udpClient = CreateConfiguredUdpClient(0);
 		return ((IPEndPoint)udpClient.Client.LocalEndPoint).Port;
 	}
 
-	private void StartReceiveLoop(CancellationToken token)
+	private int BindUdpOnlySocket(int preferredPort)
+	{
+		udpClient = CreateConfiguredUdpClient(preferredPort);
+		return ((IPEndPoint)udpClient.Client.LocalEndPoint).Port;
+	}
+
+	private static UdpClient CreateConfiguredUdpClient(int port)
+	{
+		UdpClient client = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+		client.EnableBroadcast = true;
+		try
+		{
+			const int SIO_UDP_CONNRESET = -1744830452;
+			client.Client.IOControl((IOControlCode)SIO_UDP_CONNRESET, new byte[] { 0, 0, 0, 0 }, null);
+		}
+		catch { }
+		return client;
+	}
+
+	private void StartTcpAcceptLoop(CancellationToken token)
+	{
+		TcpListener listener = tcpListener;
+		if (listener == null) return;
+
+		Task.Run(async () =>
+		{
+			while (!token.IsCancellationRequested)
+			{
+				try
+				{
+					TcpClient client = await listener.AcceptTcpClientAsync();
+					client.NoDelay = true;
+					lock (connectedTcpClients)
+					{
+						connectedTcpClients.Add(client);
+					}
+					_ = HandleTcpClientLoopAsync(client, token);
+				}
+				catch
+				{
+					break;
+				}
+			}
+		}, token);
+	}
+
+	private async Task TryConnectTcpClientAsync(string hostStr, int port, CancellationToken token)
+	{
+		string[] candidates = { hostStr, "127.0.0.1" };
+		foreach (string candidate in candidates)
+		{
+			if (token.IsCancellationRequested || IsConnected) break;
+			try
+			{
+				TcpClient client = new TcpClient();
+				client.NoDelay = true;
+				Task connectTask = client.ConnectAsync(candidate, port);
+				if (await Task.WhenAny(connectTask, Task.Delay(1200, token)) == connectTask && client.Connected)
+				{
+					lock (connectedTcpClients)
+					{
+						connectedTcpClients.Add(client);
+					}
+
+					SendTcpLine(client, $"HELLO|{localPeerId}");
+					await HandleTcpClientLoopAsync(client, token);
+					break;
+				}
+				client.Close();
+			}
+			catch { }
+		}
+	}
+
+	private async Task HandleTcpClientLoopAsync(TcpClient client, CancellationToken token)
+	{
+		try
+		{
+			IPEndPoint remoteEp = client.Client.RemoteEndPoint as IPEndPoint;
+			using (StreamReader reader = new StreamReader(client.GetStream(), Encoding.UTF8))
+			{
+				while (!token.IsCancellationRequested && client.Connected)
+				{
+					string line = await reader.ReadLineAsync();
+					if (line == null) break;
+					if (line.StartsWith("AGY|", StringComparison.Ordinal))
+					{
+						incomingPackets.Enqueue((remoteEp, line.Substring(4), true));
+					}
+				}
+			}
+		}
+		catch { }
+		finally
+		{
+			lock (connectedTcpClients)
+			{
+				connectedTcpClients.Remove(client);
+			}
+			try { client.Close(); } catch { }
+		}
+	}
+
+	private static void SendTcpLine(TcpClient client, string payload)
+	{
+		try
+		{
+			if (client == null || !client.Connected) return;
+			byte[] bytes = Encoding.UTF8.GetBytes("AGY|" + payload + "\n");
+			NetworkStream stream = client.GetStream();
+			stream.WriteAsync(bytes, 0, bytes.Length);
+		}
+		catch { }
+	}
+
+	private void StartUdpReceiveLoop(CancellationToken token)
 	{
 		UdpClient client = udpClient;
 		if (client == null) return;
@@ -388,7 +529,7 @@ public class MultiplayerManager : MonoBehaviour
 					string text = Encoding.UTF8.GetString(data);
 					if (text.StartsWith("AGY|", StringComparison.Ordinal))
 					{
-						incomingPackets.Enqueue((result.RemoteEndPoint, text.Substring(4)));
+						incomingPackets.Enqueue((result.RemoteEndPoint, text.Substring(4), true));
 					}
 				}
 				catch (ObjectDisposedException)
@@ -410,9 +551,9 @@ public class MultiplayerManager : MonoBehaviour
 			try { action?.Invoke(); } catch { }
 		}
 
-		while (incomingPackets.TryDequeue(out (IPEndPoint ep, string msg) packet))
+		while (incomingPackets.TryDequeue(out (IPEndPoint ep, string msg, bool isDirect) packet))
 		{
-			ProcessPacket(packet.ep, packet.msg);
+			ProcessPacket(packet.ep, packet.msg, packet.isDirect);
 		}
 
 		if (!IsHosting && !IsClient)
@@ -427,14 +568,24 @@ public class MultiplayerManager : MonoBehaviour
 
 		float now = Time.unscaledTime;
 
+		// Client connection probes: Direct UDP + Localhost + LAN Broadcast + Relay
 		if (IsClient && now >= nextHelloTime)
 		{
-			nextHelloTime = now + 0.8f;
+			nextHelloTime = now + (peers.Count == 0 ? 0.6f : 2.5f);
+			string hello = $"HELLO|{localPeerId}|{LocalIpPort}";
+
 			if (targetHostEndpoint != null)
 			{
-				SendUdp(targetHostEndpoint, $"HELLO|{localPeerId}");
-				// Also try localhost on target port if testing on the same machine
-				SendUdp(new IPEndPoint(IPAddress.Loopback, targetHostEndpoint.Port), $"HELLO|{localPeerId}");
+				SendUdp(targetHostEndpoint, hello);
+			}
+
+			// Always probe localhost & LAN broadcast on targetHostPort (and 7777) so same-PC and same-Wi-Fi work even if Public IP was entered!
+			SendUdp(new IPEndPoint(IPAddress.Loopback, targetHostPort), hello);
+			SendUdp(new IPEndPoint(IPAddress.Broadcast, targetHostPort), hello);
+			if (targetHostPort != 7777)
+			{
+				SendUdp(new IPEndPoint(IPAddress.Loopback, 7777), hello);
+				SendUdp(new IPEndPoint(IPAddress.Broadcast, 7777), hello);
 			}
 		}
 
@@ -484,9 +635,8 @@ public class MultiplayerManager : MonoBehaviour
 			pos.x, pos.y, pos.z,
 			yaw, pitch, crouch, speed, grounded, heldId, holdingGun);
 
-		SendToAllPeers(stateMsg);
+		SendToAllPeers(stateMsg, isImportantEvent: false);
 
-		// If holding an object, sync that object every tick
 		if (heldId >= 0 && heldId < syncedBodies.Count)
 		{
 			Rigidbody heldRb = syncedBodies[heldId];
@@ -496,8 +646,7 @@ public class MultiplayerManager : MonoBehaviour
 			}
 		}
 
-		// Host also trickles dynamic physics objects so stacks/balls stay in sync
-		if (IsHosting && syncedBodies.Count > 0)
+		if (IsHosting && syncedBodies.Count > 0 && peers.Count > 0)
 		{
 			for (int k = 0; k < 3; k++)
 			{
@@ -530,7 +679,7 @@ public class MultiplayerManager : MonoBehaviour
 			v.x, v.y, v.z,
 			isHeld ? 1 : 0);
 
-		SendToAllPeers(objMsg);
+		SendToAllPeers(objMsg, isImportantEvent: false);
 	}
 
 	public void BroadcastShot(Vector3 origin, Vector3 direction)
@@ -547,34 +696,62 @@ public class MultiplayerManager : MonoBehaviour
 			origin.x, origin.y, origin.z,
 			direction.x, direction.y, direction.z);
 
-		SendToAllPeers(shotMsg, alsoRelayImmediate: true);
+		SendToAllPeers(shotMsg, isImportantEvent: true);
 	}
 
-	private void SendToAllPeers(string message, bool alsoRelayImmediate = false)
+	private void SendToAllPeers(string message, bool isImportantEvent)
 	{
+		bool anyPeerNeedsRelay = peers.Count == 0;
+
 		if (IsHosting)
 		{
 			foreach (KeyValuePair<string, PeerState> kvp in peers)
 			{
-				if (kvp.Value.udpEndpoint != null)
+				PeerState p = kvp.Value;
+				if (p.udpEndpoint != null)
 				{
-					SendUdp(kvp.Value.udpEndpoint, message);
+					SendUdp(p.udpEndpoint, message);
+				}
+
+				if (Time.unscaledTime - p.lastDirectUdpTime > 3.0f)
+				{
+					anyPeerNeedsRelay = true;
 				}
 			}
 		}
-		else if (IsClient && targetHostEndpoint != null)
+		else if (IsClient)
 		{
-			SendUdp(targetHostEndpoint, message);
+			if (targetHostEndpoint != null)
+			{
+				SendUdp(targetHostEndpoint, message);
+			}
+
+			foreach (KeyValuePair<string, PeerState> kvp in peers)
+			{
+				if (Time.unscaledTime - kvp.Value.lastDirectUdpTime > 3.0f)
+				{
+					anyPeerNeedsRelay = true;
+				}
+			}
 		}
 
-		// Fallback relay for strict NAT peers
-		if (!string.IsNullOrEmpty(activeRelayTopic))
+		lock (connectedTcpClients)
+		{
+			for (int i = 0; i < connectedTcpClients.Count; i++)
+			{
+				SendTcpLine(connectedTcpClients[i], message);
+			}
+		}
+
+		// Use public relay only when needed (at a safe 1.5s interval that never triggers rate limits)
+		if ((anyPeerNeedsRelay || isImportantEvent) && !string.IsNullOrEmpty(primaryRelayTopic) && netCts != null)
 		{
 			float now = Time.unscaledTime;
-			if (alsoRelayImmediate || now >= nextRelaySendTime)
+			if (isImportantEvent || now >= nextRelayStateTime)
 			{
-				nextRelaySendTime = now + 0.22f;
-				SendRelayPacket(activeRelayTopic, message);
+				nextRelayStateTime = now + 1.5f;
+				string topic = !string.IsNullOrEmpty(secondaryRelayTopic) ? secondaryRelayTopic : primaryRelayTopic;
+				_ = PostRelayMessageAsync(topic, message, netCts.Token);
 			}
 		}
 	}
@@ -594,7 +771,7 @@ public class MultiplayerManager : MonoBehaviour
 		catch { }
 	}
 
-	private void ProcessPacket(IPEndPoint senderEp, string message)
+	private void ProcessPacket(IPEndPoint senderEp, string message, bool isDirect)
 	{
 		if (string.IsNullOrEmpty(message))
 		{
@@ -614,11 +791,19 @@ public class MultiplayerManager : MonoBehaviour
 			return;
 		}
 
-		PeerState peer = GetOrCreatePeer(senderId, senderEp);
+		PeerState peer = GetOrCreatePeer(senderId, senderEp, isDirect);
 
 		if (cmd == "HELLO")
 		{
-			SendUdp(senderEp, $"WELCOME|{localPeerId}");
+			if (senderEp != null)
+			{
+				SendUdp(senderEp, $"WELCOME|{localPeerId}|{LocalIpPort}");
+			}
+
+			if (parts.Length >= 3 && TryParseEndpoint(parts[2], out IPEndPoint reportedLanEp))
+			{
+				SendUdp(reportedLanEp, $"WELCOME|{localPeerId}|{LocalIpPort}");
+			}
 			return;
 		}
 
@@ -633,19 +818,29 @@ public class MultiplayerManager : MonoBehaviour
 
 		if (cmd == "PUNCH" && parts.Length >= 4)
 		{
-			// Received NAT hole-punch request via signaling channel!
+			// Received NAT hole-punch request via signaling stream!
 			if (TryParseEndpoint(parts[2], out IPEndPoint pubEp))
 			{
 				peer.udpEndpoint = pubEp;
-				for (int i = 0; i < 4; i++)
+				for (int i = 0; i < 5; i++)
 				{
-					SendUdp(pubEp, $"WELCOME|{localPeerId}");
+					SendUdp(pubEp, $"WELCOME|{localPeerId}|{LocalIpPort}");
 				}
 			}
 
 			if (TryParseEndpoint(parts[3], out IPEndPoint lanEp))
 			{
-				SendUdp(lanEp, $"WELCOME|{localPeerId}");
+				if (peer.udpEndpoint == null) peer.udpEndpoint = lanEp;
+				for (int i = 0; i < 3; i++)
+				{
+					SendUdp(lanEp, $"WELCOME|{localPeerId}|{LocalIpPort}");
+				}
+			}
+
+			// Also reply over the relay stream so the client knows we're here even if symmetric NAT blocks UDP
+			if (netCts != null && !string.IsNullOrEmpty(primaryRelayTopic))
+			{
+				_ = PostRelayMessageAsync(primaryRelayTopic, $"WELCOME|{localPeerId}|{LocalIpPort}", netCts.Token);
 			}
 			return;
 		}
@@ -661,7 +856,6 @@ public class MultiplayerManager : MonoBehaviour
 			peer.heldObjectId = (int)ParseFloat(parts[8]);
 			peer.isHoldingGun = parts[9] == "1";
 
-			// If Hosting, relay this peer's state to any other connected clients
 			if (IsHosting)
 			{
 				foreach (KeyValuePair<string, PeerState> kvp in peers)
@@ -717,7 +911,7 @@ public class MultiplayerManager : MonoBehaviour
 		}
 	}
 
-	private PeerState GetOrCreatePeer(string peerId, IPEndPoint senderEp)
+	private PeerState GetOrCreatePeer(string peerId, IPEndPoint senderEp, bool isDirect)
 	{
 		if (!peers.TryGetValue(peerId, out PeerState peer))
 		{
@@ -736,12 +930,11 @@ public class MultiplayerManager : MonoBehaviour
 
 			if (IsHosting)
 			{
-				string shown = DisplayAddress;
-				SetStatus($"OPEN ON: {shown}\n({peers.Count} player(s) connected)");
+				SetStatus($"OPEN ON: {DisplayAddress}  |  {peers.Count} player(s) joined!");
 			}
 			else if (IsClient)
 			{
-				SetStatus($"Connected to host ({peers.Count} remote player(s))");
+				SetStatus($"CONNECTED TO HOST ({peers.Count + 1} players in game)");
 			}
 		}
 
@@ -752,6 +945,11 @@ public class MultiplayerManager : MonoBehaviour
 			{
 				targetHostEndpoint = senderEp;
 			}
+		}
+
+		if (isDirect)
+		{
+			peer.lastDirectUdpTime = Time.unscaledTime;
 		}
 
 		peer.lastSeenTime = Time.unscaledTime;
@@ -816,78 +1014,114 @@ public class MultiplayerManager : MonoBehaviour
 		bullet.AddComponent<BulletVisualMover>().Initialize(dir * 65f, 0.6f);
 	}
 
+	private void OnGUI()
+	{
+		if ((!IsHosting && !IsClient) || EscMenu.IsPaused)
+		{
+			return;
+		}
+
+		Rect boxRect = new Rect(14f, 14f, 430f, 46f);
+		string modeText = IsHosting
+			? $"HOSTING  |  Share IP:Port: {DisplayAddress}  (LAN: {LocalIpPort})\nPlayers in lobby: {peers.Count + 1}"
+			: (peers.Count > 0
+				? $"MULTIPLAYER CONNECTED  |  Players in lobby: {peers.Count + 1}"
+				: $"MP: {StatusMessage}");
+		GUI.Box(boxRect, modeText);
+	}
+
 	// =========================================================================
-	// Zero-Port-Forwarding Helpers: STUN + UPnP IGD + Public Signaling/Relay
+	// Zero-Port-Forwarding Helpers: Streaming Signaling + STUN + UPnP IGD
 	// =========================================================================
 
 	private static string GetRelayTopic(string addressPort)
 	{
 		string clean = addressPort.Trim().ToLowerInvariant().Replace(".", "_").Replace(":", "_");
-		return "agy_mp_room_" + clean;
+		return "agy_mp_v2_" + clean;
 	}
 
-	private void StartRelayListener(string topic)
+	private static string GetPortRelayTopic(int port)
 	{
-		activeRelayTopic = topic;
-		if (!relayPollRunning)
-		{
-			relayPollRunning = true;
-			StartCoroutine(PollRelayRoutine());
-		}
+		return "agy_mp_port_" + port;
 	}
 
-	private IEnumerator PollRelayRoutine()
+	private void StartRelayStream(string topic, CancellationToken token)
 	{
-		string lastId = "";
-		while (relayPollRunning && (IsHosting || IsClient))
+		if (string.IsNullOrEmpty(topic)) return;
+
+		Task.Run(async () =>
 		{
-			if (!string.IsNullOrEmpty(activeRelayTopic))
+			while (!token.IsCancellationRequested)
 			{
-				string url = $"https://ntfy.sh/{activeRelayTopic}/raw?poll=1&since=10s";
-				using (UnityWebRequest req = UnityWebRequest.Get(url))
+				try
 				{
-					req.timeout = 4;
-					yield return req.SendWebRequest();
-					if (req.result == UnityWebRequest.Result.Success && !string.IsNullOrEmpty(req.downloadHandler.text))
+					HttpWebRequest req = WebRequest.CreateHttp($"https://ntfy.sh/{topic}/raw");
+					req.Timeout = Timeout.Infinite;
+					req.ReadWriteTimeout = Timeout.Infinite;
+
+					using (token.Register(() => { try { req.Abort(); } catch { } }))
+					using (WebResponse resp = await req.GetResponseAsync())
+					using (Stream stream = resp.GetResponseStream())
+					using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
 					{
-						string[] lines = req.downloadHandler.text.Split('\n');
-						for (int i = 0; i < lines.Length; i++)
+						while (!token.IsCancellationRequested)
 						{
-							string line = lines[i].Trim();
-							if (string.IsNullOrEmpty(line) || line == lastId) continue;
-							lastId = line;
-							incomingPackets.Enqueue(( null, line ));
+							string line = await reader.ReadLineAsync();
+							if (line == null) break;
+							line = line.Trim();
+							if (line.StartsWith("AGY|", StringComparison.Ordinal))
+							{
+								incomingPackets.Enqueue((null, line.Substring(4), false));
+							}
 						}
 					}
 				}
+				catch
+				{
+					if (token.IsCancellationRequested) break;
+					await Task.Delay(2000, token);
+				}
 			}
-
-			yield return new WaitForSecondsRealtime(1.1f);
-		}
-
-		relayPollRunning = false;
+		}, token);
 	}
 
-	private void SendRelayPacket(string topic, string message)
+	private static async Task PostRelayMessageAsync(string topic, string payload, CancellationToken token)
 	{
-		if (string.IsNullOrEmpty(topic) || string.IsNullOrEmpty(message))
+		if (string.IsNullOrEmpty(topic) || string.IsNullOrEmpty(payload) || token.IsCancellationRequested)
 		{
 			return;
 		}
 
-		StartCoroutine(PostRelayPacketRoutine(topic, message));
+		try
+		{
+			HttpWebRequest req = WebRequest.CreateHttp($"https://ntfy.sh/{topic}");
+			req.Method = "POST";
+			req.Timeout = 4000;
+			byte[] data = Encoding.UTF8.GetBytes("AGY|" + payload);
+			using (Stream s = await req.GetRequestStreamAsync())
+			{
+				await s.WriteAsync(data, 0, data.Length, token);
+			}
+			using (WebResponse resp = await req.GetResponseAsync()) { }
+		}
+		catch { }
 	}
 
-	private static IEnumerator PostRelayPacketRoutine(string topic, string message)
+	private static async Task<string> FetchPublicIpHttpAsync()
 	{
-		byte[] body = Encoding.UTF8.GetBytes(message);
-		using (UnityWebRequest req = new UnityWebRequest($"https://ntfy.sh/{topic}", "POST"))
+		try
 		{
-			req.uploadHandler = new UploadHandlerRaw(body);
-			req.downloadHandler = new DownloadHandlerBuffer();
-			req.timeout = 4;
-			yield return req.SendWebRequest();
+			using (WebClient wc = new WebClient())
+			{
+				string ip = (await wc.DownloadStringTaskAsync("https://api.ipify.org")).Trim();
+				if (IPAddress.TryParse(ip, out _))
+				{
+					return ip;
+				}
+			}
 		}
+		catch { }
+		return null;
 	}
 
 	private async Task<IPEndPoint> QueryStunPublicEndpointAsync(UdpClient socket)
@@ -902,16 +1136,15 @@ public class MultiplayerManager : MonoBehaviour
 			"stun.cloudflare.com:3478"
 		};
 
-		// Build 20-byte RFC 5389 STUN Binding Request
 		byte[] request = new byte[20];
 		request[0] = 0x00;
-		request[1] = 0x01; // Binding Request
+		request[1] = 0x01;
 		request[2] = 0x00;
-		request[3] = 0x00; // Message Length = 0
+		request[3] = 0x00;
 		request[4] = 0x21;
 		request[5] = 0x12;
 		request[6] = 0xA4;
-		request[7] = 0x42; // Magic Cookie 0x2112A442
+		request[7] = 0x42;
 		System.Random rng = new System.Random();
 		for (int i = 8; i < 20; i++)
 		{
@@ -938,9 +1171,9 @@ public class MultiplayerManager : MonoBehaviour
 				IPEndPoint stunEp = new IPEndPoint(ipv4, int.Parse(hp[1]));
 
 				await socket.SendAsync(request, request.Length, stunEp);
-				for (int wait = 0; wait < 12; wait++)
+				for (int wait = 0; wait < 10; wait++)
 				{
-					await Task.Delay(80);
+					await Task.Delay(70);
 					if (discoveredStunEndpoint != null)
 					{
 						return discoveredStunEndpoint;
@@ -968,7 +1201,6 @@ public class MultiplayerManager : MonoBehaviour
 			idx += 4;
 			if (idx + attrLen > buf.Length) break;
 
-			// XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
 			if ((attrType == 0x0020 || attrType == 0x0001) && attrLen >= 8 && buf[idx + 1] == 0x01)
 			{
 				bool isXor = attrType == 0x0020;
@@ -1040,25 +1272,28 @@ public class MultiplayerManager : MonoBehaviour
 					Uri controlUri = new Uri(baseUri, controlPath);
 
 					string localIp = GetLocalLanIPv4();
-					string soapBody =
-						"<?xml version=\"1.0\"?>" +
-						"<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
-						"<s:Body>" +
-						$"<u:AddPortMapping xmlns:u=\"{serviceType}\">" +
-						"<NewRemoteHost></NewRemoteHost>" +
-						$"<NewExternalPort>{port}</NewExternalPort>" +
-						"<NewProtocol>UDP</NewProtocol>" +
-						$"<NewInternalPort>{port}</NewInternalPort>" +
-						$"<NewInternalClient>{localIp}</NewInternalClient>" +
-						"<NewEnabled>1</NewEnabled>" +
-						"<NewPortMappingDescription>UnityGameMP</NewPortMappingDescription>" +
-						"<NewLeaseDuration>0</NewLeaseDuration>" +
-						"</u:AddPortMapping>" +
-						"</s:Body></s:Envelope>";
+					foreach (string proto in new[] { "UDP", "TCP" })
+					{
+						string soapBody =
+							"<?xml version=\"1.0\"?>" +
+							"<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+							"<s:Body>" +
+							$"<u:AddPortMapping xmlns:u=\"{serviceType}\">" +
+							"<NewRemoteHost></NewRemoteHost>" +
+							$"<NewExternalPort>{port}</NewExternalPort>" +
+							$"<NewProtocol>{proto}</NewProtocol>" +
+							$"<NewInternalPort>{port}</NewInternalPort>" +
+							$"<NewInternalClient>{localIp}</NewInternalClient>" +
+							"<NewEnabled>1</NewEnabled>" +
+							"<NewPortMappingDescription>UnityGameMP</NewPortMappingDescription>" +
+							"<NewLeaseDuration>0</NewLeaseDuration>" +
+							"</u:AddPortMapping>" +
+							"</s:Body></s:Envelope>";
 
-					wc.Headers.Set("Content-Type", "text/xml; charset=\"utf-8\"");
-					wc.Headers.Set("SOAPAction", $"\"{serviceType}#AddPortMapping\"");
-					await wc.UploadStringTaskAsync(controlUri, "POST", soapBody);
+						wc.Headers.Set("Content-Type", "text/xml; charset=\"utf-8\"");
+						wc.Headers.Set("SOAPAction", $"\"{serviceType}#AddPortMapping\"");
+						await wc.UploadStringTaskAsync(controlUri, "POST", soapBody);
+					}
 					return true;
 				}
 			}
@@ -1127,6 +1362,13 @@ public class MultiplayerManager : MonoBehaviour
 			string[] parts = clean.Split(':');
 			host = string.IsNullOrWhiteSpace(parts[0]) ? "127.0.0.1" : parts[0].Trim();
 			return int.TryParse(parts[1].Trim(), out port) && port > 0 && port <= 65535;
+		}
+
+		if (int.TryParse(clean, out int portOnly) && portOnly > 0 && portOnly <= 65535)
+		{
+			host = "127.0.0.1";
+			port = portOnly;
+			return true;
 		}
 
 		host = clean;
@@ -1246,7 +1488,7 @@ public class RemotePlayerAvatar : MonoBehaviour
 		visor.localScale = new Vector3(0.72f, 0.26f, 0.30f);
 
 		torsoTransform = CreatePart("Torso", PrimitiveType.Capsule, transform, shirtMat);
-		pelvisTransform = CreatePart("Pelvis", PrimitiveType.Capsule, transform, pantsMat);
+		pelvisTransform = CreatePart("Pelvis", transform, pantsMat);
 
 		leftUpperLeg = CreatePart("LeftUpperLeg", PrimitiveType.Capsule, transform, pantsMat);
 		leftLowerLeg = CreatePart("LeftLowerLeg", PrimitiveType.Capsule, transform, pantsMat);
@@ -1270,6 +1512,11 @@ public class RemotePlayerAvatar : MonoBehaviour
 		m.color = color;
 		if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", color);
 		return m;
+	}
+
+	private static Transform CreatePart(string name, Transform parent, Material mat)
+	{
+		return CreatePart(name, PrimitiveType.Capsule, parent, mat);
 	}
 
 	private static Transform CreatePart(string name, PrimitiveType type, Transform parent, Material mat)
