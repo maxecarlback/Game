@@ -327,6 +327,18 @@ public class Gun : MonoBehaviour
 			hit.rigidbody.AddForceAtPosition(shootDir * impactForce, hit.point, ForceMode.Impulse);
 		}
 
+		ReactiveTarget target = hit.collider.GetComponentInParent<ReactiveTarget>();
+		if (target != null)
+		{
+			target.OnHit();
+		}
+
+		ExplosiveBarrel barrel = hit.collider.GetComponentInParent<ExplosiveBarrel>();
+		if (barrel != null)
+		{
+			barrel.TriggerExplosion();
+		}
+
 		wall wallSurface = hit.collider.GetComponentInParent<wall>();
 		if (wallSurface != null)
 		{

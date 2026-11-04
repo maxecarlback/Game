@@ -89,6 +89,11 @@ public class control : MonoBehaviour
 			Gun.SpawnDefaultGun();
 		}
 
+		if (FindAnyObjectByType<SandboxMapBuilder>() == null)
+		{
+			new GameObject("Sandbox Map").AddComponent<SandboxMapBuilder>();
+		}
+
 		if (inputActions == null)
 		{
 			Debug.LogError("Assign the InputSystem_Actions asset to this character controller.", this);
