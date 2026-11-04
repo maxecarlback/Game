@@ -114,19 +114,7 @@ public class grinding : MonoBehaviour
 			return null;
 		}
 
-		wall wallSurface = surfaceCollider.GetComponentInParent<wall>();
-		if (wallSurface != null)
-		{
-			return wallSurface;
-		}
-
-		Renderer surfaceRenderer = surfaceCollider.GetComponent<Renderer>();
-		if (surfaceRenderer == null)
-		{
-			surfaceRenderer = surfaceCollider.GetComponentInParent<Renderer>();
-		}
-
-		return surfaceRenderer != null ? surfaceRenderer.gameObject.AddComponent<wall>() : null;
+		return surfaceCollider.GetComponentInParent<wall>();
 	}
 
 	private void OnCollisionStay(Collision collision)
