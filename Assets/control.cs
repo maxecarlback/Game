@@ -26,6 +26,9 @@ public class control : MonoBehaviour
 	[SerializeField] private float maximumLookAngle = 85f;
 	[SerializeField] private bool lockCursorOnStart = true;
 
+	[Header("Void Respawn")]
+	[SerializeField] private float voidThresholdY = -10f;
+
 	private CharacterController characterController;
 	private InputActionMap playerActions;
 	private InputAction moveAction;
@@ -38,6 +41,8 @@ public class control : MonoBehaviour
 	private Vector3 standingCenter;
 	private float standingCameraHeight = 0.72f;
 	private Vector3 currentHorizontalVelocity;
+	private Vector3 spawnPosition;
+	private Quaternion spawnRotation;
 	private float pitch;
 
 	public Vector3 HorizontalVelocity => currentHorizontalVelocity;
@@ -56,6 +61,8 @@ public class control : MonoBehaviour
 
 		standingHeight = characterController.height;
 		standingCenter = characterController.center;
+		spawnPosition = VoidRespawn.ResolveSafePlatformPosition(transform.position);
+		spawnRotation = transform.rotation;
 
 		if (cameraPivot != null)
 		{
@@ -104,6 +111,8 @@ public class control : MonoBehaviour
 
 	private void Start()
 	{
+		VoidRespawn.AttachToAllSceneRigidbodies(voidThresholdY);
+
 		if (lockCursorOnStart)
 		{
 			SetCursorLocked(true);
@@ -207,6 +216,20 @@ public class control : MonoBehaviour
 		verticalVelocity += gravity * Time.deltaTime;
 		Vector3 velocity = horizontalVelocity + Vector3.up * verticalVelocity;
 		characterController.Move(velocity * Time.deltaTime);
+
+		if (transform.position.y < voidThresholdY)
+		{
+			RespawnPlayer();
+		}
+	}
+
+	private void RespawnPlayer()
+	{
+		verticalVelocity = 0f;
+		currentHorizontalVelocity = Vector3.zero;
+		characterController.enabled = false;
+		transform.SetPositionAndRotation(spawnPosition, spawnRotation);
+		characterController.enabled = true;
 	}
 
 	private void UpdateCrouch()

@@ -81,7 +81,13 @@ public class Gun : MonoBehaviour
 		col.center = new Vector3(0f, 0.02f, 0.04f);
 		col.size = new Vector3(0.14f, 0.24f, 0.46f);
 
-		return gunObj.AddComponent<Gun>();
+		Gun gun = gunObj.AddComponent<Gun>();
+		if (gunObj.GetComponent<VoidRespawn>() == null)
+		{
+			gunObj.AddComponent<VoidRespawn>();
+		}
+
+		return gun;
 	}
 
 	private void Awake()
